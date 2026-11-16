@@ -114,18 +114,34 @@ def get_allowed_next_agents(state: AgentState):
 
     completed = set(state.get("completed_agents", []))
 
+    # Stage 1: Research
     if "researcher" not in completed:
         return {"researcher"}
 
+    # Stage 2: Analysis
     if "analyst" not in completed:
         return {"analyst"}
 
+    # Stage 3: Report writing
     if "writer" not in completed:
         return {"writer"}
 
+    # Stage 4: Optional file execution
     if "tool_executor" not in completed:
-        return {"tool_executor", "finish"}
 
+        user_request = state["user_request"].lower()
+
+        requires_pdf_action = any(
+            keyword in user_request
+            for keyword in ["pdf", "save", "export"]
+        )
+
+        if requires_pdf_action:
+            return {"tool_executor"}
+
+        return {"finish"}
+
+    # All required work is complete
     return {"finish"}
 
 
@@ -135,8 +151,10 @@ def get_allowed_next_agents(state: AgentState):
 
 def supervisor_node(state: AgentState):
 
-    supervisor = build_supervisor_chain()
+    # Get the allowed next route first.
+    allowed_agents = get_allowed_next_agents(state)
 
+    # Build context for the LLM.
     context = {
         "user_request": state["user_request"],
         "completed_agents": state.get("completed_agents", []),
@@ -155,25 +173,42 @@ def supervisor_node(state: AgentState):
         )
     }
 
+    # Initialize the LLM.
+    supervisor = build_supervisor_chain()
+
+    # Ask the LLM for a structured decision.
     response = supervisor.invoke([
         ("system", SUPERVISOR_PROMPT),
         ("human", json.dumps(context, indent=2))
     ])
 
     # ======================================
-    # VALIDATE ROUTING DECISION
+    # VALIDATE AND SELECT ROUTING DECISION
     # ======================================
 
-    allowed_agents = get_allowed_next_agents(state)
+    # If only one route is allowed, use it directly.
+    # This prevents the LLM from selecting an already
+    # completed agent.
 
-    if response.next_agent not in allowed_agents:
+    if len(allowed_agents) == 1:
+
+        selected_agent = next(iter(allowed_agents))
+
+    # If multiple routes are allowed, validate
+    # the LLM's decision against the allowed routes.
+
+    elif response.next_agent in allowed_agents:
+
+        selected_agent = response.next_agent
+
+    else:
 
         raise ValueError(
             f"Invalid supervisor decision: {response.next_agent}. "
             f"Allowed decisions: {allowed_agents}"
         )
 
-    # Preserve the original plan after initial planning
+    # Preserve the original plan after initial planning.
     plan = state.get("plan") or response.plan
 
     # ======================================
@@ -184,18 +219,18 @@ def supervisor_node(state: AgentState):
 
         "current_agent": "supervisor",
 
-        "next_agent": response.next_agent,
+        "next_agent": selected_agent,
 
         "plan": plan,
 
         "status": (
             "completed"
-            if response.next_agent == "finish"
+            if selected_agent == "finish"
             else "running"
         ),
 
         "execution_log": [
-            f"Supervisor selected: {response.next_agent}",
+            f"Supervisor selected: {selected_agent}",
             f"Reason: {response.reasoning}"
         ]
     }
