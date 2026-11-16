@@ -2,7 +2,7 @@
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 
 from langgraph.types import Command
@@ -28,8 +28,12 @@ async def lifespan(app: FastAPI):
             checkpointer=checkpointer
         )
 
+        # Store background workflow statuses.
+        app.state.workflow_jobs = {}
+
         print("LangGraph workflow initialized.")
         print("SQLite checkpointer connected.")
+        print("Background workflow tracking initialized.")
 
         yield
 
@@ -109,6 +113,40 @@ def get_pending_interrupts(snapshot):
 
     return interrupts
 
+def run_workflow_background(thread_id: str, initial_state: dict):
+
+    graph = get_graph()
+    config = get_workflow_config(thread_id)
+
+    # Track the workflow's current execution status.
+    app.state.workflow_jobs[thread_id] = "running"
+
+    try:
+
+        result = graph.invoke(
+            initial_state,
+            config=config
+        )
+
+        interrupts = result.get("__interrupt__", [])
+
+        if interrupts:
+            app.state.workflow_jobs[thread_id] = (
+                "paused_for_approval"
+            )
+        else:
+            app.state.workflow_jobs[thread_id] = (
+                result.get("status", "completed")
+            )
+
+    except Exception as error:
+
+        app.state.workflow_jobs[thread_id] = "failed"
+
+        print(
+            f"Workflow {thread_id} failed: {error}"
+        )
+
 
 # ==========================================
 # 5. HEALTH CHECK
@@ -128,15 +166,16 @@ def health_check():
 # 6. START WORKFLOW
 # ==========================================
 
-@app.post("/api/v1/workflows")
-def start_workflow(request: WorkflowRequest):
+
+@app.post("/api/v1/workflows", status_code=202)
+def start_workflow(
+    request: WorkflowRequest,
+    background_tasks: BackgroundTasks
+):
 
     graph = get_graph()
 
-    # Generate a unique workflow ID.
     thread_id = str(uuid4())
-
-    config = get_workflow_config(thread_id)
 
     initial_state = {
 
@@ -153,41 +192,29 @@ def start_workflow(request: WorkflowRequest):
         "errors": []
     }
 
-    try:
+    # Register the workflow before scheduling it.
+    app.state.workflow_jobs[thread_id] = "queued"
 
-        result = graph.invoke(
-            initial_state,
-            config=config
+    # Schedule background execution.
+    background_tasks.add_task(
+        run_workflow_background,
+        thread_id,
+        initial_state
+    )
+
+    # Return immediately instead of waiting for Ollama.
+    return {
+
+        "thread_id": thread_id,
+
+        "status": "queued",
+
+        "message": "Workflow accepted and scheduled.",
+
+        "status_endpoint": (
+            f"/api/v1/workflows/{thread_id}"
         )
-
-        interrupts = result.get("__interrupt__", [])
-
-        if interrupts:
-
-            approval_data = interrupts[0].value
-
-            return {
-                "thread_id": thread_id,
-                "status": "paused_for_approval",
-                "approval_required": True,
-                "approval_request": approval_data
-            }
-
-        return {
-            "thread_id": thread_id,
-            "status": result.get("status"),
-            "approval_required": False,
-            "completed_agents": result.get(
-                "completed_agents", []
-            )
-        }
-
-    except Exception as error:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Workflow execution failed: {str(error)}"
-        )
+    }
 
 
 # ==========================================
@@ -198,12 +225,24 @@ def start_workflow(request: WorkflowRequest):
 def get_workflow_status(thread_id: str):
 
     graph = get_graph()
-
     config = get_workflow_config(thread_id)
+
+    job_status = app.state.workflow_jobs.get(thread_id)
 
     snapshot = graph.get_state(config)
 
+    # The background task may not have created its first
+    # checkpoint yet. Return its in-memory status meanwhile.
     if not snapshot.values:
+
+        if job_status is not None:
+
+            return {
+                "thread_id": thread_id,
+                "status": job_status,
+                "completed_agents": [],
+                "approval_required": False
+            }
 
         raise HTTPException(
             status_code=404,
@@ -216,13 +255,16 @@ def get_workflow_status(thread_id: str):
 
     approval_required = len(interrupts) > 0
 
-    workflow_status = values.get(
-        "status",
-        "unknown"
-    )
+    workflow_status = values.get("status", "unknown")
 
     if approval_required:
         workflow_status = "paused_for_approval"
+
+    elif job_status == "failed":
+        workflow_status = "failed"
+
+    elif job_status in {"queued", "running"}:
+        workflow_status = job_status
 
     return {
 
@@ -250,7 +292,6 @@ def get_workflow_status(thread_id: str):
 
         "errors": values.get("errors", [])
     }
-
 
 # ==========================================
 # 8. HUMAN APPROVAL ENDPOINT
@@ -286,7 +327,10 @@ def submit_approval(
             detail="Workflow is not waiting for approval."
         )
 
+    
     try:
+
+        app.state.workflow_jobs[thread_id] = "running"
 
         result = graph.invoke(
             Command(
@@ -296,6 +340,17 @@ def submit_approval(
             ),
             config=config
         )
+
+        interrupts_after_resume = result.get(
+            "__interrupt__", []
+        )
+
+        if interrupts_after_resume:
+            new_status = "paused_for_approval"
+        else:
+            new_status = result.get("status", "completed")
+
+        app.state.workflow_jobs[thread_id] = new_status
 
         return {
 
@@ -307,7 +362,7 @@ def submit_approval(
                 else "rejected"
             ),
 
-            "status": result.get("status"),
+            "status": new_status,
 
             "approval_status": result.get(
                 "approval_status"
@@ -324,10 +379,13 @@ def submit_approval(
 
     except Exception as error:
 
+        app.state.workflow_jobs[thread_id] = "failed"
+
         raise HTTPException(
             status_code=500,
             detail=f"Approval processing failed: {str(error)}"
         )
+
 
 
 # ==========================================
