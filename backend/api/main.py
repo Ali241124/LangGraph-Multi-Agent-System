@@ -113,30 +113,46 @@ def get_pending_interrupts(snapshot):
 
     return interrupts
 
+
 def run_workflow_background(thread_id: str, initial_state: dict):
 
-    graph = get_graph()
-    config = get_workflow_config(thread_id)
-
-    # Track the workflow's current execution status.
-    app.state.workflow_jobs[thread_id] = "running"
+    print(f"\n[BACKGROUND] Starting workflow: {thread_id}")
 
     try:
+
+        graph = get_graph()
+        config = get_workflow_config(thread_id)
+
+        app.state.workflow_jobs[thread_id] = "running"
+
+        print("[BACKGROUND] Calling LangGraph graph.invoke()")
 
         result = graph.invoke(
             initial_state,
             config=config
         )
 
+        print("[BACKGROUND] Workflow execution returned.")
+
         interrupts = result.get("__interrupt__", [])
 
         if interrupts:
+
             app.state.workflow_jobs[thread_id] = (
                 "paused_for_approval"
             )
+
+            print("[BACKGROUND] Waiting for human approval.")
+
         else:
+
             app.state.workflow_jobs[thread_id] = (
                 result.get("status", "completed")
+            )
+
+            print(
+                f"[BACKGROUND] Final status: "
+                f"{app.state.workflow_jobs[thread_id]}"
             )
 
     except Exception as error:
@@ -144,8 +160,12 @@ def run_workflow_background(thread_id: str, initial_state: dict):
         app.state.workflow_jobs[thread_id] = "failed"
 
         print(
-            f"Workflow {thread_id} failed: {error}"
+            f"[BACKGROUND ERROR] Workflow {thread_id} failed: "
+            f"{repr(error)}"
         )
+
+        import traceback
+        traceback.print_exc()
 
 
 # ==========================================
