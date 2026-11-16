@@ -13,7 +13,7 @@ from backend.state.schemas import AgentState
 # 1. SUPERVISOR CONFIGURATION
 # ==========================================
 
-MODEL_NAME = "qwen2.5:7b"
+MODEL_NAME = "qwen2.5:1.5b"
 
 
 # ==========================================
